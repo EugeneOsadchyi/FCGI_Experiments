@@ -4,9 +4,11 @@ use strict;
 use warnings;
 
 use FCGI;
+use CGI::Fast;
 use Data::Dumper;
 
 my $terminate = 0;
+my $PIPES_PER_INSTANCE = 2;
 
 $\ = "\n";
 
@@ -16,102 +18,221 @@ $SIG{CHLD} = sub {};
 &main;
 
 sub main {
-    if(scalar @ARGV < 3) {
-        print "[$$-Manager] Error. Usage: path backlog count";
-        exit();
+  if(scalar @ARGV < 3) {
+      print "[$$-Manager] Error. Usage: path backlog count";
+      exit(1);
+  }
+
+  print "[$$-Manager] Starting...";
+
+  my $path    = $ARGV[0];
+  my $backlog = int($ARGV[1]);
+  my $count   = int($ARGV[2]);
+
+  my $socket = FCGI::OpenSocket($path, $backlog) or die "[$$-Manager] Error. Failed to open socket.";
+
+  my $pid;
+  my %forks;
+
+  print "[$$-Manager] Initializing pipes...";
+  my ($fcgi_pipes, $db_pipes) = init_pipes($count);
+
+  print "[$$-Manager] Starting FCGI childs...";
+  for(my $i = 0; $i < $count; $i++) {
+    unless($pid = fork()) {
+      close_pipes($db_pipes);
+      run_fcgi($$fcgi_pipes[$i], $socket);
     }
 
-    my $path    = $ARGV[0];
-    my $backlog = int($ARGV[1]);
-    my $count   = int($ARGV[2]);
+    log_fork(\%forks, 'FCGI', $pid, $$db_pipes[$i]); #TODO what I should store here as read/write pipes
+  }
+  close_pipes($fcgi_pipes);
 
-    print "[$$-Manager] Starting...";
+  print "[$$-Manager] Starting DB...";
+  unless ($pid = fork()) {
+      run_db($db_pipes);
+  }
+  log_fork(\%forks, 'DB', $pid); #TODO what I should store here as read/write pipes
 
-    my $socket = FCGI::OpenSocket($path, $backlog);
-    if(!$socket) {
-        print "[$$-Manager] Error. Failed to open socket.";
-        exit();
+  print "[$$-Manager] Stated all childs.\n" . Dumper(\%forks);
+
+  FCGI::CloseSocket($socket);
+
+  print "[$$-Manager] Closed socket";
+  sleep while(!$terminate);
+
+  print "[$$-Manager] Terminating all FCGIs and exiting...\n";
+
+  exit(0);
+}
+
+sub init_pipes {
+  my $instance_count = shift;
+  my $fcgi_pipes;
+  my $db_pipes;
+
+  my $pipe_counter = 0;
+
+  for(my $i = 0; $i < $instance_count * $PIPES_PER_INSTANCE; $i++) {
+    my $pipe = open_pipe();
+
+    if($i % 2 == 0) {
+      $$fcgi_pipes[ $pipe_counter ]->{read}  = $pipe->{read};
+      $$db_pipes[ $pipe_counter]->{write}    = $pipe->{write};
+    } else {
+      $$fcgi_pipes[ $pipe_counter ]->{write} = $pipe->{write};
+      $$db_pipes[ $pipe_counter ]->{read}    = $pipe->{read};
+
+      $pipe_counter++;
     }
+  }
 
-pipe(FCGI_READ, FCGI_WRITE);
-pipe(DB_READ, DB_WRITE);
+  return ($fcgi_pipes, $db_pipes);
+}
 
-FCGI_WRITE->autoflush(1);
-DB_WRITE->autoflush(1);
+sub open_pipe {
+  my ($READ, $WRITE);
 
-    my $pid;
-    my %pids;
+  pipe($READ, $WRITE);
+  $WRITE->autoflush(1);
 
-    unless ($pid = fork()) {
-        close(FCGI_READ) or warn "[$$-DB] Can't close FCGI_READ";
-        process_db(\*DB_READ, \*FCGI_WRITE);
-        exit(0);
+  return {
+    read  => $READ,
+    write => $WRITE
+  };
+}
+
+sub close_pipes {
+  my $pipes = shift;
+
+  $pipes = [$pipes] if(ref($pipes) eq 'HASH');
+
+  foreach my $pipe (@{$pipes}) {
+    close($pipe->{write}) or warn "[$$] Can't close WRITE pipe";
+    close($pipe->{read})  or warn "[$$] Can't close READ pipe";
+  }
+
+  return;
+}
+
+sub log_fork {
+  my ($log_storage, $type, $pid, $pipe) = @_;
+
+  $log_storage->{$pid} = {
+              type  => $type,
+              pipes => $pipe,
+  };
+}
+
+sub run_db {
+  my $pipes = shift;
+
+  print "[$$-DB] Started";
+
+  my $response;
+
+  while(!$terminate) {
+    for(my $i = 0; $i < scalar(@$pipes); $i++) {
+      my $READ  = $pipes->[$i]->{read};
+      my $WRITE = $pipes->[$i]->{write};
+
+      $response = <$READ>;
+
+      chomp($response);
+
+      print STDOUT "[$$-DB] pipe #$i said \"$response\"";
+      sleep(1);
     }
+  }
 
-    $pids{$pid} = 'DB';
+  close_pipes($pipes);
+  print "[$$-DB] Closed pipes...";
 
-    for (1..$count) {
-        unless($pid = fork()) {
-            close(DB_READ) or warn "[$$-FCGI] Can't close DB_READ";
-            process_fcgi(\*FCGI_READ, \*DB_WRITE, $socket);
-            exit(0);
-        }
-        $pids{$pid} = 'FCGI';
-    }
+  exit(0);
+}
 
-    print "[$$-Manager] Stated all childs. Waiting for signal...\n";
+sub run_fcgi {
+    my ($pipe, $socket) = @_;
 
-    FCGI::CloseSocket($socket);
+    $CGI::Fast::Ext_Request = FCGI::Request(
+      \*STDIN, \*STDOUT, \*STDERR,
+      \%ENV, int($socket || 0), 1
+    );
 
-    print "[$$-Manager] Closed socket";
-    sleep while(!$terminate);
+    print "[$$-FCGI] Created";
 
-    print "[$$-Manager] Terminating all FCGIs and exiting...\n";
+    handle_fcgi_requests($pipe);
+
+    close_pipes($pipe);
+    print "[$$-FCGI] Closed pipes...";
 
     exit(0);
 }
 
-sub process_fcgi {
-    my ($FCGI_READ, $DB_WRITE, $socket) = @_;
+sub handle_fcgi_requests {
+  my $pipe = shift;
 
-    print "[$$-FCGI] Created";
+  my $READ  = $pipe->{read};
+  my $WRITE = $pipe->{write};
 
-    my $count = 0;
-    my $request = FCGI::Request(
-       \*STDIN, \*STDOUT, \*STDERR,
-       \%ENV, int($socket || 0), 1
-    );
+  my $count = 0;
+  my $request;
 
-    while($request->Accept() >= 0) {
-        print "Content-type:text/plain;charset=utf-8\r\n\r\n";
-        print "[$$]";
-        print "Counter: $count";
-        ++$count;
+  while($request = CGI::Fast->new) {
+    print $WRITE "I'm $$";
+    # print "Content-type:text/plain;charset=utf-8\r\n\r\n";
+    # print "[$$]\n";
+    # print "Counter: $count";
+    # ++$count;
+    #
+    # print $WRITE "$count";
 
-        print $DB_WRITE "$count";
-    }
-
-    print "[$$-FCGI] Closing...";
-
-    close($DB_WRITE)    or warn "[$$-FCGI] Can\'t close \$DB_WRITE. Reason: $@";
-    close($FCGI_READ)   or warn "[$$-FCGI] Can\'t close \$FCGI_READ. Reason: $@";
+    build_html($request);
+  }
 }
 
-sub process_db {
-    my ($DB_READ, $FCGI_WRITE) = @_;
-    my $data;
+sub build_html {
+  my $request = shift;
+  my $params = $request->Vars;
 
-    print "[$$-DB] Started";
+  print "Content-type:text/html;charset=utf-8\r\n\r\n";
 
-    my $response;
-    while($response = <$DB_READ>) {
-        chomp($response);
-        #last if($response eq 'close');
-        print STDOUT "[$$-DB] Response from FCGI: \"$response\"";
-    }
+  print <<EOD;
+<!DOCTYPE html>
+<html>
+  <head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+EOD
+print "<title>Welcome</title>";
+print <<EOD;
+  </head>
+  <body>
+EOD
 
-    print "[$$-DB] Closing...";
+print "<h3>I'm [$$-FCGI] instance</h3>";
 
-    close($DB_READ)     or warn "[$$-DB] Can\'t close \$DB_READ";
-    close($FCGI_WRITE)  or warn "[$$-DB] Can\'t close \$FCGI_WRITE";
+
+if((keys %$params) != 0) {
+  build_welcome_html();
+} else {
+  build_login_html();
+}
+
+print <<EOD;
+  </body>
+<html>
+EOD
+}
+
+sub build_login_html {
+  print <<EOD;
+  <h1>LOGIN<h1>
+<html>
+EOD
+}
+
+sub build_welcome_html {
+  print <<EOD;
+  <h1>WELCOME</h1>
+EOD
 }
