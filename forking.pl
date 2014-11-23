@@ -5,8 +5,6 @@ use warnings;
 
 use FCGI;
 use CGI::Fast;
-
-use IO::Select;
 use Data::Dumper;
 
 my $terminate = 0;
@@ -63,11 +61,8 @@ sub main {
   print "[$$-Manager] Closed socket";
   sleep while(!$terminate);
 
-  print "[$$-Manager] Terminating all FCGIs";
+  print "[$$-Manager] Terminating all FCGIs and exiting...\n";
 
-  waitpid($_, 0) foreach (keys %forks);
-
-  print "[$$-Manager] Exiting...";
   exit(0);
 }
 
@@ -135,23 +130,18 @@ sub run_db {
   print "[$$-DB] Started";
 
   my $response;
-  my $buff_size = 1024;
-  my $select_read_handler = IO::Select->new();
 
+  while(!$terminate) {
+    for(my $i = 0; $i < scalar(@$pipes); $i++) {
+      my $READ  = $pipes->[$i]->{read};
+      my $WRITE = $pipes->[$i]->{write};
 
-  for(my $i = 0; $i < scalar(@$pipes); $i++) {
-    $select_read_handler->add($pipes->[$i]->{read});
-    # my $WRITE = $pipes->[$i]->{write};
-  }
+      $response = <$READ>;
 
-  print STDOUT "[$$-DB] I have " . $select_read_handler->count() . " READ handlers";
-
-  while(my @ready_handlers = $select_read_handler->can_read()) {
-    foreach my $rh (@ready_handlers) {
-      my $bytes = sysread($rh, $response, $buff_size);
       chomp($response);
 
-      print STDOUT "[$$-DB] I received message \"$response\"";
+      print STDOUT "[$$-DB] pipe #$i said \"$response\"";
+      sleep(1);
     }
   }
 
