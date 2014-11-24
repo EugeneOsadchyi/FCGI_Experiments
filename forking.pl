@@ -6,11 +6,17 @@ use warnings;
 use FCGI;
 use CGI::Fast;
 
+use IO::Handle;
 use IO::Select;
 use Data::Dumper;
 
+use constant PIPES_PER_INSTANCE => 2;
+
+use constant NEW_USER => 0;
+use constant OLD_USER => 1;
+use constant NOT_VALID_VALUE => -1;
+
 my $terminate = 0;
-my $PIPES_PER_INSTANCE = 2;
 
 $\ = "\n";
 
@@ -78,7 +84,7 @@ sub init_pipes {
 
   my $pipe_counter = 0;
 
-  for(my $i = 0; $i < $instance_count * $PIPES_PER_INSTANCE; $i++) {
+  for(my $i = 0; $i < $instance_count * PIPES_PER_INSTANCE; $i++) {
     my $pipe = open_pipe();
 
     if($i % 2 == 0) {
@@ -132,26 +138,51 @@ sub log_fork {
 sub run_db {
   my $pipes = shift;
 
+  my %DB_STORAGE;
   print "[$$-DB] Started";
 
+  my %handlers; #TODO find better name
   my $response;
   my $buff_size = 1024;
+
+  my $io_handler = IO::Handle->new();
   my $select_read_handler = IO::Select->new();
 
 
-  for(my $i = 0; $i < scalar(@$pipes); $i++) {
+  for(my $i = 0; $i < scalar(@$pipes); $i++) {  #TODO find better solution (maybe extract some method)
+    my $handler_id = fileno($pipes->[$i]->{read});
+    $handlers{$handler_id} = $pipes->[$i]->{write};
+
     $select_read_handler->add($pipes->[$i]->{read});
-    # my $WRITE = $pipes->[$i]->{write};
   }
 
   print STDOUT "[$$-DB] I have " . $select_read_handler->count() . " READ handlers";
 
   while(my @ready_handlers = $select_read_handler->can_read()) {
     foreach my $rh (@ready_handlers) {
+      my $wh = $handlers{fileno($rh)};
       my $bytes = sysread($rh, $response, $buff_size);
       chomp($response);
 
-      print STDOUT "[$$-DB] I received message \"$response\"";
+
+      my ($pid, $user_name) = split(",", $response);
+      print STDOUT "[$$-DB] Receiced data from $pid";
+      $user_name =~ s/^\s*(\w+)\s*$/$1/;
+
+      print STDERR $user_name;
+      my $prepared_data;
+
+      if($user_name !~ /^\s*\w+\s*$/) {
+        $prepared_data = NOT_VALID_VALUE;
+      } elsif(exists($DB_STORAGE{$user_name})) {
+        $prepared_data = join(",", OLD_USER, $user_name);
+      } else {
+        $DB_STORAGE{$user_name} = 1;
+        $prepared_data = join(",", NEW_USER, $user_name)
+      }
+
+      print STDERR $prepared_data;
+      print $wh $prepared_data;
     }
   }
 
@@ -182,28 +213,33 @@ sub run_fcgi {
 sub handle_fcgi_requests {
   my $pipe = shift;
 
-  my $READ  = $pipe->{read};
-  my $WRITE = $pipe->{write};
+  my $READ_HANDLER  = $pipe->{read};
+  my $WRITE_HANDLER = $pipe->{write};
 
+  my $buff_size = 1024;
   my $count = 0;
   my $request;
+  my $response;
 
   while($request = CGI::Fast->new) {
-    print $WRITE "I'm $$";
-    # print "Content-type:text/plain;charset=utf-8\r\n\r\n";
-    # print "[$$]\n";
-    # print "Counter: $count";
-    # ++$count;
-    #
-    # print $WRITE "$count";
+    my $params = $request->Vars;
 
-    build_html($request);
+    if($params->{user_name}) {
+      print "Have user name";
+      print $WRITE_HANDLER "$$, " . $params->{user_name};
+      my $bytes = sysread($READ_HANDLER, $response, $buff_size); #TODO make a cover method for this
+    }
+print STDERR "Splitting";
+    my @fields = split(",", $response);
+
+    build_html(\@fields);
   }
 }
 
 sub build_html {
-  my $request = shift;
-  my $params = $request->Vars;
+  my $response = shift;
+
+  my ($status, $user_name) = @{$response};
 
   print "Content-type:text/html;charset=utf-8\r\n\r\n";
 
@@ -219,13 +255,13 @@ print <<EOD;
   <body>
 EOD
 
-print "<h3>I'm [$$-FCGI] instance</h3>";
+print "<h3>[$$-FCGI]</h3>";
 
 
-if((keys %$params) != 0) {
-  build_welcome_html();
+if($user_name) {
+  build_welcome_html($status, $user_name);
 } else {
-  build_login_html();
+  build_login_html($status);
 }
 
 print <<EOD;
@@ -235,14 +271,22 @@ EOD
 }
 
 sub build_login_html {
+  my $status= shift;
+
+  print "<h1>LOGIN<h1>";
+  print "<h3 style='color:red;'>You entered not valid data</h3>" if($status == NOT_VALID_VALUE);
   print <<EOD;
-  <h1>LOGIN<h1>
+  <form id="login_form" enctype="multipart/form-data" method="post">
+    <input id="user_name" name="user_name" placeholder="User Name"/>
+  <button type="submit">Send</button>
+  </form>
 <html>
 EOD
 }
 
 sub build_welcome_html {
-  print <<EOD;
-  <h1>WELCOME</h1>
-EOD
+  my ($status, $user_name) = @_;
+
+  print "<h1>WELCOME</h1>";
+  print "<p>" . ($status == NEW_USER ? "You just created new user " : "You logged in as "). "$user_name</p>";
 }
