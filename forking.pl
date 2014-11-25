@@ -11,10 +11,11 @@ use IO::Select;
 use Data::Dumper;
 
 use constant PIPES_PER_INSTANCE => 2;
+use constant READ_BUFFER_SIZE   => 1024;
 
-use constant NEW_USER => 0;
-use constant OLD_USER => 1;
-use constant NOT_VALID_VALUE => -1;
+use constant NEW_USER         => 0;
+use constant OLD_USER         => 1;
+use constant NOT_VALID_VALUE  => -1;
 
 my $terminate = 0;
 
@@ -28,10 +29,10 @@ $SIG{CHLD} = sub {};
 sub main {
   if(scalar @ARGV < 3) {
       print "[$$-Manager] Error. Usage: path backlog count";
-      exit(1);
+      exit();
   }
 
-  print "[$$-Manager] Starting...";
+  print "[$$-Manager] Starting...\n";
 
   my $path    = $ARGV[0];
   my $backlog = int($ARGV[1]);
@@ -40,19 +41,18 @@ sub main {
   my $socket = FCGI::OpenSocket($path, $backlog) or die "[$$-Manager] Error. Failed to open socket.";
 
   my $pid;
-  my %forks;
+  my $forks = {};
 
-  print "[$$-Manager] Initializing pipes...";
   my ($fcgi_pipes, $db_pipes) = init_pipes($count);
 
   print "[$$-Manager] Starting FCGI childs...";
   for(my $i = 0; $i < $count; $i++) {
     unless($pid = fork()) {
       close_pipes($db_pipes);
-      run_fcgi($$fcgi_pipes[$i], $socket);
+      run_fcgi(${$fcgi_pipes}[$i], $socket);
     }
 
-    log_fork(\%forks, 'FCGI', $pid, $$db_pipes[$i]); #TODO what I should store here as read/write pipes
+    log_fork($forks, 'FCGI', $pid, ${$db_pipes}[$i]);
   }
   close_pipes($fcgi_pipes);
 
@@ -60,21 +60,27 @@ sub main {
   unless ($pid = fork()) {
       run_db($db_pipes);
   }
-  log_fork(\%forks, 'DB', $pid); #TODO what I should store here as read/write pipes
-
-  print "[$$-Manager] Stated all childs.\n" . Dumper(\%forks);
+  log_fork($forks, 'DB', $pid);
 
   FCGI::CloseSocket($socket);
 
-  print "[$$-Manager] Closed socket";
+  print "[$$-Manager] Stated all childs. In deep sleep mode now...";
   sleep while(!$terminate);
 
-  print "[$$-Manager] Terminating all FCGIs";
+  print "[$$-Manager] Terminating all child processes";
+  waitpid($_, 0) foreach (keys %{$forks});
 
-  waitpid($_, 0) foreach (keys %forks);
-
-  print "[$$-Manager] Exiting...";
   exit(0);
+}
+
+sub close_all_connections {
+  my $socket;
+  my $pipes;
+
+  FCGI::CloseSocket($socket) if($socket);
+  close_pipes($pipes) if($pipes);
+
+  return;
 }
 
 sub init_pipes {
@@ -101,7 +107,7 @@ sub init_pipes {
   return ($fcgi_pipes, $db_pipes);
 }
 
-sub open_pipe {
+sub open_pipe() {
   my ($READ, $WRITE);
 
   pipe($READ, $WRITE);
@@ -113,7 +119,7 @@ sub open_pipe {
   };
 }
 
-sub close_pipes {
+sub close_pipes($) {
   my $pipes = shift;
 
   $pipes = [$pipes] if(ref($pipes) eq 'HASH');
@@ -133,6 +139,8 @@ sub log_fork {
               type  => $type,
               pipes => $pipe,
   };
+
+  return;
 }
 
 sub run_db {
@@ -141,56 +149,95 @@ sub run_db {
   my %DB_STORAGE;
   print "[$$-DB] Started";
 
-  my %handlers; #TODO find better name
+  my %read_handler_to_write_handler_list;
   my $response;
-  my $buff_size = 1024;
 
-  my $io_handler = IO::Handle->new();
   my $select_read_handler = IO::Select->new();
 
+  %read_handler_to_write_handler_list = build_read_to_write_handlers_map($pipes);
+  $select_read_handler = add_all_read_handlers($select_read_handler, $pipes);
 
-  for(my $i = 0; $i < scalar(@$pipes); $i++) {  #TODO find better solution (maybe extract some method)
-    my $handler_id = fileno($pipes->[$i]->{read});
-    $handlers{$handler_id} = $pipes->[$i]->{write};
+  while(my @ready_to_read_handlers = $select_read_handler->can_read()) {
+    foreach my $rh (@ready_to_read_handlers) {
+      my $response = listen_pipe($rh);
+      my $prepared_data = process_data($response, \%DB_STORAGE); #TODO Dont like this method
 
-    $select_read_handler->add($pipes->[$i]->{read});
-  }
-
-  print STDOUT "[$$-DB] I have " . $select_read_handler->count() . " READ handlers";
-
-  while(my @ready_handlers = $select_read_handler->can_read()) {
-    foreach my $rh (@ready_handlers) {
-      my $wh = $handlers{fileno($rh)};
-      my $bytes = sysread($rh, $response, $buff_size);
-      chomp($response);
-
-
-      my ($pid, $user_name) = split(",", $response);
-      print STDOUT "[$$-DB] Receiced data from $pid";
-      $user_name =~ s/^\s*(\w+)\s*$/$1/;
-
-      print STDERR $user_name;
-      my $prepared_data;
-
-      if($user_name !~ /^\s*\w+\s*$/) {
-        $prepared_data = NOT_VALID_VALUE;
-      } elsif(exists($DB_STORAGE{$user_name})) {
-        $prepared_data = join(",", OLD_USER, $user_name);
-      } else {
-        $DB_STORAGE{$user_name} = 1;
-        $prepared_data = join(",", NEW_USER, $user_name)
-      }
-
-      print STDERR $prepared_data;
-      print $wh $prepared_data;
+      define_write_handler_and_write_to_pipe($rh, \%read_handler_to_write_handler_list, $prepared_data); #TODO Dont like this method
     }
   }
 
-  close_pipes($pipes);
-  print "[$$-DB] Closed pipes...";
+  print "[$$-DB] Closing all connections and exiting...";
+  close_all_connections($pipes);
 
   exit(0);
 }
+
+sub build_read_to_write_handlers_map {
+  my $pipes = shift;
+
+  my %handlers;
+  my $handler_id;
+
+  foreach my $pipe (@$pipes) {
+    $handler_id = fileno($pipe->{read});
+    $handlers{$handler_id} = $pipe->{write};
+  }
+
+  return %handlers;
+}
+
+sub add_all_read_handlers {
+  my $select_read_handler = shift;
+  my $pipes = shift;
+
+  foreach my $pipe (@$pipes) {
+    $select_read_handler->add($pipe->{read});
+  }
+
+  return $select_read_handler;
+}
+
+sub listen_pipe {
+  my $rh = shift;
+  my $response;
+
+  my $bytes = sysread($rh, $response, READ_BUFFER_SIZE);
+  chomp($response);
+
+  return $response;
+}
+
+sub define_write_handler_and_write_to_pipe {
+  my $rh = shift;
+  my $handlers = shift;
+  my $prepared_data = shift;
+
+  my $wh = $handlers->{fileno($rh)};
+  print $wh $prepared_data;
+
+  return 0;
+}
+
+sub process_data {
+  my $response = shift;
+  my $DB_STORAGE = shift;
+  my $prepared_data;
+
+  my ($pid, $user_name) = split(",", $response);
+  $user_name =~ s/^\s*(\w+)\s*$/$1/;
+
+  if($user_name !~ /\w+/) {
+    $prepared_data = NOT_VALID_VALUE;
+  } elsif(exists($DB_STORAGE->{$user_name})) {
+    $prepared_data = join(",", OLD_USER, $user_name);
+  } else {
+    $DB_STORAGE->{$user_name} = 1;
+    $prepared_data = join(",", NEW_USER, $user_name)
+  }
+
+  return $prepared_data;
+}
+
 
 sub run_fcgi {
     my ($pipe, $socket) = @_;
@@ -200,12 +247,12 @@ sub run_fcgi {
       \%ENV, int($socket || 0), 1
     );
 
-    print "[$$-FCGI] Created";
+    print "[$$-FCGI] Started";
 
     handle_fcgi_requests($pipe);
 
-    close_pipes($pipe);
-    print "[$$-FCGI] Closed pipes...";
+    print "[$$-FCGI] Closing all connections and exiting...";
+    close_all_connections($socket, $pipe);
 
     exit(0);
 }
@@ -216,8 +263,6 @@ sub handle_fcgi_requests {
   my $READ_HANDLER  = $pipe->{read};
   my $WRITE_HANDLER = $pipe->{write};
 
-  my $buff_size = 1024;
-  my $count = 0;
   my $request;
   my $response;
 
@@ -225,11 +270,10 @@ sub handle_fcgi_requests {
     my $params = $request->Vars;
 
     if($params->{user_name}) {
-      print "Have user name";
       print $WRITE_HANDLER "$$, " . $params->{user_name};
-      my $bytes = sysread($READ_HANDLER, $response, $buff_size); #TODO make a cover method for this
+      $response = listen_pipe($READ_HANDLER);
     }
-print STDERR "Splitting";
+
     my @fields = split(",", $response);
 
     build_html(\@fields);
