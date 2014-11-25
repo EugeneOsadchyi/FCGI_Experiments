@@ -264,9 +264,9 @@ sub handle_fcgi_requests {
   my $WRITE_HANDLER = $pipe->{write};
 
   my $request;
-  my $response;
 
   while($request = CGI::Fast->new) {
+    my $response;
     my $params = $request->Vars;
 
     if($params->{user_name}) {
