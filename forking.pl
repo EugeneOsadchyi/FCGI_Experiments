@@ -8,7 +8,9 @@ use CGI::Fast;
 
 use IO::Handle;
 use IO::Select;
+
 use Data::Dumper;
+use JSON;
 
 use constant PIPES_PER_INSTANCE => 2;
 use constant READ_BUFFER_SIZE   => 1024;
@@ -204,6 +206,8 @@ sub listen_pipe {
   my $bytes = sysread($rh, $response, READ_BUFFER_SIZE);
   chomp($response);
 
+  $response = decode_json($response);
+
   return $response;
 }
 
@@ -223,21 +227,29 @@ sub process_data {
   my $DB_STORAGE = shift;
   my $prepared_data;
 
-  my ($pid, $user_name) = split(",", $response);
-  $user_name =~ s/^\s*(\w+)\s*$/$1/;
+  my $user_name = trim($response->{user_name});
 
-  if($user_name !~ /\w+/) {
-    $prepared_data = NOT_VALID_VALUE;
-  } elsif(exists($DB_STORAGE->{$user_name})) {
-    $prepared_data = join(",", OLD_USER, $user_name);
+  if(exists($DB_STORAGE->{$user_name})) {
+    $prepared_data = encode_json({
+      user_name   => $user_name,
+      is_new_user => JSON::false,
+    });
   } else {
     $DB_STORAGE->{$user_name} = 1;
-    $prepared_data = join(",", NEW_USER, $user_name)
+    $prepared_data = encode_json({
+      user_name    => $user_name,
+      is_new_user  => JSON::true,
+    });
   }
 
   return $prepared_data;
 }
 
+sub trim {
+  my $string = shift;
+  $string =~ s/^s+|s+$//g;
+  return $string;
+}
 
 sub run_fcgi {
     my ($pipe, $socket) = @_;
@@ -267,23 +279,26 @@ sub handle_fcgi_requests {
 
   while($request = CGI::Fast->new) {
     my $response;
+    my $query;
     my $params = $request->Vars;
 
-    if($params->{user_name}) {
-      print $WRITE_HANDLER "$$, " . $params->{user_name};
+    if(scalar(keys %$params) > 0) {
+      $query = encode_json({
+        user_name     => $params->{user_name}
+      });
+      print $WRITE_HANDLER $query;
       $response = listen_pipe($READ_HANDLER);
     }
 
-    my @fields = split(",", $response);
-
-    build_html(\@fields);
+    build_html($response);
   }
 }
 
 sub build_html {
   my $response = shift;
 
-  my ($status, $user_name) = @{$response};
+  my $is_new_user = $response->{is_new_user};
+  my $user_name   = $response->{user_name};
 
   print "Content-type:text/html;charset=utf-8\r\n\r\n";
 
@@ -303,9 +318,9 @@ print "<h3>[$$-FCGI]</h3>";
 
 
 if($user_name) {
-  build_welcome_html($status, $user_name);
+  build_welcome_html($is_new_user, $user_name);
 } else {
-  build_login_html($status);
+  build_login_html();
 }
 
 print <<EOD;
@@ -315,10 +330,8 @@ EOD
 }
 
 sub build_login_html {
-  my $status= shift;
-
   print "<h1>LOGIN<h1>";
-  print "<h3 style='color:red;'>You entered not valid data</h3>" if($status == NOT_VALID_VALUE);
+  #print "<h3 style='color:red;'>You entered not valid data</h3>" #TODO has errors
   print <<EOD;
   <form id="login_form" enctype="multipart/form-data" method="post">
     <input id="user_name" name="user_name" placeholder="User Name"/>
@@ -329,8 +342,8 @@ EOD
 }
 
 sub build_welcome_html {
-  my ($status, $user_name) = @_;
+  my ($is_new_user, $user_name) = @_;
 
   print "<h1>WELCOME</h1>";
-  print "<p>" . ($status == NEW_USER ? "You just created new user " : "You logged in as "). "$user_name</p>";
+  print "<p>" . ($is_new_user ? "You just created new user " : "You logged in as "). "$user_name</p>";
 }
