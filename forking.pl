@@ -5,6 +5,7 @@ use warnings;
 
 use FCGI;
 use CGI::Fast;
+use CGI::Cookie;
 
 use IO::Handle;
 use IO::Select;
@@ -15,9 +16,7 @@ use JSON;
 use constant PIPES_PER_INSTANCE => 2;
 use constant READ_BUFFER_SIZE   => 1024;
 
-use constant NEW_USER         => 0;
-use constant OLD_USER         => 1;
-use constant NOT_VALID_VALUE  => -1;
+use constant USER_NAME_PASS_PATTERN => qr/^\w+$/; #TODO implement validation of username and password
 
 my $terminate = 0;
 
@@ -75,9 +74,13 @@ sub main {
   exit(0);
 }
 
+
+### Working with connections ###
 sub close_all_connections {
   my $socket;
   my $pipes;
+
+  print "[$$] Closing all connections and exiting...";
 
   FCGI::CloseSocket($socket) if($socket);
   close_pipes($pipes) if($pipes);
@@ -134,6 +137,18 @@ sub close_pipes($) {
   return;
 }
 
+sub listen_pipe {
+  my $rh = shift;
+  my $response;
+
+  my $bytes = sysread($rh, $response, READ_BUFFER_SIZE);
+  chomp($response);
+
+  $response = decode_json($response);
+
+  return $response;
+}
+
 sub log_fork {
   my ($log_storage, $type, $pid, $pipe) = @_;
 
@@ -145,33 +160,44 @@ sub log_fork {
   return;
 }
 
+## END of working with connections ###
+
+
+
+## DB code ###
+
 sub run_db {
   my $pipes = shift;
 
-  my %DB_STORAGE;
+  my (%DB_USERS, %DB_SESSIONS);
   print "[$$-DB] Started";
 
-  my %read_handler_to_write_handler_list;
-  my $response;
-
-  my $select_read_handler = IO::Select->new();
-
-  %read_handler_to_write_handler_list = build_read_to_write_handlers_map($pipes);
-  $select_read_handler = add_all_read_handlers($select_read_handler, $pipes);
+  my $select_read_handler = add_all_read_handlers($pipes);;
+  my %read_handler_to_write_handler_list = build_read_to_write_handlers_map($pipes);
 
   while(my @ready_to_read_handlers = $select_read_handler->can_read()) {
     foreach my $rh (@ready_to_read_handlers) {
-      my $response = listen_pipe($rh);
-      my $prepared_data = process_data($response, \%DB_STORAGE); #TODO Dont like this method
+      my $response_json = listen_pipe($rh);
+      my $prepared_data = process_data($response_json, \%DB_USERS, \%DB_SESSIONS); #TODO Dont like this method
 
       define_write_handler_and_write_to_pipe($rh, \%read_handler_to_write_handler_list, $prepared_data); #TODO Dont like this method
     }
   }
 
-  print "[$$-DB] Closing all connections and exiting...";
   close_all_connections($pipes);
-
   exit(0);
+}
+
+sub add_all_read_handlers {
+  my $pipes = shift;
+
+  my $select_read_handler = IO::Select->new();
+
+  foreach my $pipe (@$pipes) {
+    $select_read_handler->add($pipe->{read});
+  }
+
+  return $select_read_handler;
 }
 
 sub build_read_to_write_handlers_map {
@@ -188,29 +214,6 @@ sub build_read_to_write_handlers_map {
   return %handlers;
 }
 
-sub add_all_read_handlers {
-  my $select_read_handler = shift;
-  my $pipes = shift;
-
-  foreach my $pipe (@$pipes) {
-    $select_read_handler->add($pipe->{read});
-  }
-
-  return $select_read_handler;
-}
-
-sub listen_pipe {
-  my $rh = shift;
-  my $response;
-
-  my $bytes = sysread($rh, $response, READ_BUFFER_SIZE);
-  chomp($response);
-
-  $response = decode_json($response);
-
-  return $response;
-}
-
 sub define_write_handler_and_write_to_pipe {
   my $rh = shift;
   my $handlers = shift;
@@ -223,33 +226,132 @@ sub define_write_handler_and_write_to_pipe {
 }
 
 sub process_data {
-  my $response = shift;
-  my $DB_STORAGE = shift;
-  my $prepared_data;
+  my $args        = shift;
+  my $DB_USERS    = shift;
+  my $DB_SESSIONS = shift;
 
-  my $user_name = trim($response->{user_name});
+  my $response = {};
+  my $encoded_response;
 
-  if(exists($DB_STORAGE->{$user_name})) {
-    $prepared_data = encode_json({
-      user_name   => $user_name,
-      is_new_user => JSON::false,
-    });
+  if(is_save_surway($args)) {
+    $response = process_save_surway($args, $DB_USERS, $DB_SESSIONS);
+  } elsif(is_register_or_login($args)) {
+    $response = process_register_or_login($args, $DB_USERS, $DB_SESSIONS)
+  } elsif(is_logout($args)) {
+    $response = process_logout($args, $DB_USERS, $DB_SESSIONS);
+  } elsif(is_login_from_session($args)) {
+    $response = process_login_from_session($args, $DB_USERS, $DB_SESSIONS);
   } else {
-    $DB_STORAGE->{$user_name} = 1;
-    $prepared_data = encode_json({
-      user_name    => $user_name,
-      is_new_user  => JSON::true,
-    });
+    print STDERR "[$$-DB] Dont know, how to process data";
   }
 
-  return $prepared_data;
+  $encoded_response = encode_json($response);
+
+  return $encoded_response;
 }
 
-sub trim {
-  my $string = shift;
-  $string =~ s/^s+|s+$//g;
-  return $string;
+sub is_save_surway {
+  return defined($_[0]->{surway});
 }
+
+sub is_register_or_login {
+  return  (
+            defined($_[0]->{sid}) &&
+            defined($_[0]->{user_name}) &&
+            defined($_[0]->{user_password})
+          );
+}
+
+sub is_login_from_session {
+  return defined($_[0]->{sid});
+}
+
+sub is_logout {
+  return defined($_[0]->{logout});
+}
+
+sub process_register_or_login {
+  my ($args, $DB_USERS, $DB_SESSIONS) = @_;
+
+  my $sid      = $args->{sid};
+  my $name     = $args->{user_name};
+  my $password = $args->{user_password};
+
+  if(exists($DB_USERS->{$name})) {
+    if($DB_USERS->{$name}->{password} ne $password) {
+      return { errors => { not_walid_password => 1 } };
+    }
+  } else {
+    $DB_USERS->{$name} = { password => $password, surway => {} };
+  }
+
+  $DB_SESSIONS->{$sid} = $name;
+
+  return {
+      sid => $sid,
+      user_name => $name,
+      surway => $DB_USERS->{$name}->{surway}
+  };
+}
+
+sub process_login_from_session {
+  my ($args, $DB_USERS, $DB_SESSIONS) = @_;
+
+  my $sid = $args->{sid};
+
+  if(exists($DB_SESSIONS->{$sid})) {
+    my $name = $DB_SESSIONS->{$sid};
+
+    return {
+        sid => $sid,
+        user_name => $name,
+        surway => $DB_USERS->{$name}->{surway},
+    };
+  } else {
+    return { errors => { session_expired => 1 } };
+  }
+}
+
+sub process_save_surway {
+  my ($args, $DB_USERS, $DB_SESSIONS) = @_;
+
+  my $sid    = $args->{sid};
+  my $surway = $args->{surway};
+  my $name;
+
+  if(exists($DB_SESSIONS->{$sid})) {
+    $name = $DB_SESSIONS->{$sid};
+
+    $DB_USERS->{$name}->{surway} = $surway;
+
+  } else {
+    return { errors => { session_expired => 1 } };
+  }
+
+  return {
+      sid => $sid,
+      user_name => $name,
+      surway => $surway,
+  };
+}
+
+sub process_logout {
+  my ($args, $DB_USERS, $DB_SESSIONS) = @_;
+
+  my $sid = $args->{sid};
+
+  if(exists($DB_SESSIONS->{$sid})) {
+    delete $DB_SESSIONS->{$sid};
+  }
+
+  return { logout => 1 };
+}
+
+### END of DB code ###
+
+
+
+### FCGI code ###
 
 sub run_fcgi {
     my ($pipe, $socket) = @_;
@@ -275,30 +377,90 @@ sub handle_fcgi_requests {
   my $READ_HANDLER  = $pipe->{read};
   my $WRITE_HANDLER = $pipe->{write};
 
-  my $request;
-
-  while($request = CGI::Fast->new) {
+  while(my $request = CGI::Fast->new) {
+    my $params = $request->Vars;
     my $response;
     my $query;
-    my $params = $request->Vars;
+    my $sid;
 
-    if(scalar(keys %$params) > 0) {
-      $query = encode_json({
-        user_name     => $params->{user_name}
-      });
-      print $WRITE_HANDLER $query;
-      $response = listen_pipe($READ_HANDLER);
+    my %cookies = CGI::Cookie->fetch;
+    unless($sid = eval{ $cookies{sid}->value }) {
+      $sid = generate_random_string();
+      set_onload_session_cookie($sid);
     }
+    $params->{sid} = $sid;
+
+    $query = prepare_request_to_db($params);
+    $response = write_to_db($query, $READ_HANDLER, $WRITE_HANDLER);
 
     build_html($response);
   }
 }
 
-sub build_html {
-  my $response = shift;
+sub set_onload_session_cookie {
+  my $sid = shift;
 
-  my $is_new_user = $response->{is_new_user};
-  my $user_name   = $response->{user_name};
+  my $cookie = CGI::Cookie->new(
+    -name    =>  'sid',
+    -value   =>  $sid,
+    -expires =>  '+3M',
+  );
+
+  print "Set-Cookie: $cookie";
+  return;
+}
+
+sub prepare_request_to_db {
+  my $params = shift;
+  my $query_data;
+
+  $query_data = prepare_request_params_to_db($params);
+
+  return encode_json($query_data);
+}
+
+sub prepare_request_params_to_db {
+  my $params = shift;
+  my ($surway, $query_data);
+
+  $surway     = merge_surway_data($params);
+  $query_data = merge_defined_params($params);
+
+  $query_data->{surway} = $surway;
+
+  return $query_data;
+}
+
+sub merge_surway_data {
+  my $params = shift;
+  my $surway;
+
+  map { $_ =~ /surway/ ? ( ($surway->{$_} = $params->{$_}) && delete $params->{$_} ) : () } (keys %{$params});
+
+  return $surway;
+}
+
+sub merge_defined_params {
+  my $params = shift;
+  my $query_data;
+
+  map{ defined($params->{$_}) ? ($query_data->{$_} = trim($params->{$_})) : () } (keys %{$params});
+
+  return $query_data;
+}
+
+sub write_to_db {
+  my ($query, $READ_HANDLER, $WRITE_HANDLER) = @_;
+  my $response;
+
+  print $WRITE_HANDLER $query;
+  $response = listen_pipe($READ_HANDLER);
+
+  return $response;
+}
+
+sub build_html {
+  my $args = shift;
 
   print "Content-type:text/html;charset=utf-8\r\n\r\n";
 
@@ -308,42 +470,83 @@ sub build_html {
   <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 EOD
-print "<title>Welcome</title>";
-print <<EOD;
-  </head>
-  <body>
-EOD
+  print "<title>Welcome</title>";
+  print <<EOT;
+    </head>
+    <body>
+EOT
 
-print "<h3>[$$-FCGI]</h3>";
+  print "<h3>[$$-FCGI]</h3>";
 
+  if (defined($args->{surway})) {
+    build_welcome_html($args);
+  } else {
+    build_login_html($args);
+  }
 
-if($user_name) {
-  build_welcome_html($is_new_user, $user_name);
-} else {
-  build_login_html();
-}
-
-print <<EOD;
-  </body>
-<html>
-EOD
+  print <<EOT;
+    </body>
+  <html>
+EOT
 }
 
 sub build_login_html {
+  my $args = shift;
+
   print "<h1>LOGIN<h1>";
-  #print "<h3 style='color:red;'>You entered not valid data</h3>" #TODO has errors
+  if(defined($args->{errors})) {
+    print "<h3 style='color:red;'>Your session expired.</h3>" if($args->{errors}->{session_expired});
+    print "<h3 style='color:red;'>Not valid password</h3>"    if($args->{errors}->{not_walid_password});
+  }
   print <<EOD;
-  <form id="login_form" enctype="multipart/form-data" method="post">
-    <input id="user_name" name="user_name" placeholder="User Name"/>
-  <button type="submit">Send</button>
+  <form id="login_form" method="post">
+    <p>
+      <input type="text" id="user_name" name="user_name" placeholder="User Name"/><br/>
+      <input type="password" id="user_password" name="user_password" placeholder="Password"/>
+    </p>
+    <button type="submit">Send</button>
   </form>
 <html>
 EOD
 }
 
 sub build_welcome_html {
-  my ($is_new_user, $user_name) = @_;
+  my $args = shift;
 
+  my $user_name = $args->{user_name};
+  my $surway    = $args->{surway};
+  print STDERR Dumper($args);
   print "<h1>WELCOME</h1>";
-  print "<p>" . ($is_new_user ? "You just created new user " : "You logged in as "). "$user_name</p>";
+  print "<p>You logged in as $user_name</p>";
+  print "<form id='welcome_form' method='post'>";
+
+#TODO remove hardcode
+  print "<input type='checkbox' value='field1' name='surway_1' ", (defined($surway->{surway_1}) ? "checked" : ()), ">Field 1<br/>";
+  print "<input type='checkbox' value='field2' name='surway_2' ", (defined($surway->{surway_2}) ? "checked" : ()), ">Field 2<br/>";
+  print "<input type='checkbox' value='field3' name='surway_3' ", (defined($surway->{surway_3}) ? "checked" : ()), ">Field 3<br/>";
+  print "<input type='checkbox' value='field4' name='surway_4' ", (defined($surway->{surway_4}) ? "checked" : ()), ">Field 4<br/>";
+  print "<input type='checkbox' value='field5' name='surway_5' ", (defined($surway->{surway_5}) ? "checked" : ()), ">Field 5<br/>";
+
+  print "<input type='submit' value='Save Changes'/>";
+  print "</form>";
+
+
+  print <<EOT;
+<form id="logout_form" method="post">
+  <input type="hidden" name="logout" value="1"/>
+  <input type='submit' value='Logout'/>
+</form>
+EOT
+}
+
+### END of FCGI code ###
+
+sub trim {
+  my $string = shift;
+  $string =~ s/^\s+|\s+$//g;
+  return $string;
+}
+
+sub generate_random_string {
+  return sprintf("%08X", rand(0xffffffff));
 }
