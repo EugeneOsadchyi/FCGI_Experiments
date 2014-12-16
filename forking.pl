@@ -16,7 +16,15 @@ use JSON;
 use constant PIPES_PER_INSTANCE => 2;
 use constant READ_BUFFER_SIZE   => 1024;
 
-use constant USER_NAME_PASS_PATTERN => qr/^\w+$/; #TODO implement validation of username and password
+use constant USER_NAME_PASS_PATTERN => qr/^\w+$/;
+
+use constant SURWAY_QUESTIONS => {
+  surway1 => 'Field 1',
+  surway2 => 'Field 2',
+  surway3 => 'Field 3',
+  surway4 => 'Field 4',
+  surway5 => 'Field 5',
+};
 
 my $terminate = 0;
 
@@ -270,6 +278,16 @@ sub is_logout {
   return defined($_[0]->{logout});
 }
 
+sub is_valid_user_name {
+  my $user_name = shift;
+
+  if($user_name =~ (USER_NAME_PASS_PATTERN)) {
+    return 1
+  } else {
+    return 0;
+  }
+}
+
 sub process_register_or_login {
   my ($args, $DB_USERS, $DB_SESSIONS) = @_;
 
@@ -277,12 +295,16 @@ sub process_register_or_login {
   my $name     = $args->{user_name};
   my $password = $args->{user_password};
 
+  if(is_valid_user_name($name) && is_valid_user_name($password)) {
+    return { errors => { not_valid_format_of_name_or_password => 1 } };
+  }
+
   if(exists($DB_USERS->{$name})) {
     if($DB_USERS->{$name}->{password} ne $password) {
-      return { errors => { not_walid_password => 1 } };
+      return { errors => { not_valid_password => 1 } };
     }
   } else {
-    $DB_USERS->{$name} = { password => $password, surway => {} };
+      $DB_USERS->{$name} = { password => $password, surway => {} };
   }
 
   $DB_SESSIONS->{$sid} = $name;
@@ -323,7 +345,6 @@ sub process_save_surway {
     $name = $DB_SESSIONS->{$sid};
 
     $DB_USERS->{$name}->{surway} = $surway;
-
   } else {
     return { errors => { session_expired => 1 } };
   }
@@ -496,7 +517,7 @@ sub build_login_html {
   print "<h1>LOGIN<h1>";
   if(defined($args->{errors})) {
     print "<h3 style='color:red;'>Your session expired.</h3>" if($args->{errors}->{session_expired});
-    print "<h3 style='color:red;'>Not valid password</h3>"    if($args->{errors}->{not_walid_password});
+    print "<h3 style='color:red;'>Not valid user name or password</h3>"    if($args->{errors}->{not_valid_format_of_name_or_password});
   }
   print <<EOD;
   <form id="login_form" method="post">
@@ -515,17 +536,20 @@ sub build_welcome_html {
 
   my $user_name = $args->{user_name};
   my $surway    = $args->{surway};
-  print STDERR Dumper($args);
+
+
   print "<h1>WELCOME</h1>";
   print "<p>You logged in as $user_name</p>";
   print "<form id='welcome_form' method='post'>";
 
-#TODO remove hardcode
-  print "<input type='checkbox' value='field1' name='surway_1' ", (defined($surway->{surway_1}) ? "checked" : ()), ">Field 1<br/>";
-  print "<input type='checkbox' value='field2' name='surway_2' ", (defined($surway->{surway_2}) ? "checked" : ()), ">Field 2<br/>";
-  print "<input type='checkbox' value='field3' name='surway_3' ", (defined($surway->{surway_3}) ? "checked" : ()), ">Field 3<br/>";
-  print "<input type='checkbox' value='field4' name='surway_4' ", (defined($surway->{surway_4}) ? "checked" : ()), ">Field 4<br/>";
-  print "<input type='checkbox' value='field5' name='surway_5' ", (defined($surway->{surway_5}) ? "checked" : ()), ">Field 5<br/>";
+  foreach (sort keys (SURWAY_QUESTIONS)) {
+    my $question = (SURWAY_QUESTIONS)->{$_};
+    my $answer   = $surway->{$_};
+
+    print "<input type='checkbox' value='$_' name='$_' ", #TODO do something with value
+      (($answer ne '') ? "checked" : ()),
+      ">$question<br/>";
+  }
 
   print "<input type='submit' value='Save Changes'/>";
   print "</form>";
