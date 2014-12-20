@@ -13,18 +13,20 @@ use IO::Select;
 use Data::Dumper;
 use JSON;
 
-use constant PIPES_PER_INSTANCE => 2;
-use constant READ_BUFFER_SIZE   => 1024;
-
-use constant USER_NAME_PASS_PATTERN => qr/^\w+$/;
-
-use constant SURWAY_QUESTIONS => {
-  surway1 => 'Field 1',
-  surway2 => 'Field 2',
-  surway3 => 'Field 3',
-  surway4 => 'Field 4',
-  surway5 => 'Field 5',
-};
+# constants
+sub PIPES_PER_INSTANCE() { 2 };
+sub READ_BUFFER_SIZE() { 1024 };
+sub USER_NAME_PASS_PATTERN() { qr/^\w+$/ };
+sub SURWAY_QUESTIONS() {
+    return {
+         surway1 => 'Field 1',
+         surway2 => 'Field 2',
+         surway3 => 'Field 3',
+         surway4 => 'Field 4',
+         surway5 => 'Field 5',
+    }
+}
+# end of constants
 
 my $terminate = 0;
 
@@ -58,10 +60,10 @@ sub main {
   for(my $i = 0; $i < $count; $i++) {
     unless($pid = fork()) {
       close_pipes($db_pipes);
-      run_fcgi(${$fcgi_pipes}[$i], $socket);
+      run_fcgi($fcgi_pipes->[$i], $socket);
     }
 
-    log_fork($forks, 'FCGI', $pid, ${$db_pipes}[$i]);
+    log_fork($forks, 'FCGI', $pid, $db_pipes->[$i]);
   }
   close_pipes($fcgi_pipes);
 
@@ -77,7 +79,7 @@ sub main {
   sleep while(!$terminate);
 
   print "[$$-Manager] Terminating all child processes";
-  waitpid($_, 0) foreach (keys %{$forks});
+  waitpid($_, 0) foreach (keys %$forks);
 
   exit(0);
 }
@@ -87,8 +89,6 @@ sub main {
 sub close_all_connections {
   my $socket;
   my $pipes;
-
-  print "[$$] Closing all connections and exiting...";
 
   FCGI::CloseSocket($socket) if($socket);
   close_pipes($pipes) if($pipes);
@@ -107,11 +107,11 @@ sub init_pipes {
     my $pipe = open_pipe();
 
     if($i % 2 == 0) {
-      $$fcgi_pipes[ $pipe_counter ]->{read}  = $pipe->{read};
-      $$db_pipes[ $pipe_counter]->{write}    = $pipe->{write};
+      $fcgi_pipes->[$pipe_counter]->{read}  = $pipe->{read};
+      $db_pipes->[$pipe_counter]->{write}   = $pipe->{write};
     } else {
-      $$fcgi_pipes[ $pipe_counter ]->{write} = $pipe->{write};
-      $$db_pipes[ $pipe_counter ]->{read}    = $pipe->{read};
+      $fcgi_pipes->[$pipe_counter]->{write} = $pipe->{write};
+      $db_pipes->[$pipe_counter]->{read}    = $pipe->{read};
 
       $pipe_counter++;
     }
@@ -295,7 +295,7 @@ sub process_register_or_login {
   my $name     = $args->{user_name};
   my $password = $args->{user_password};
 
-  if(is_valid_user_name($name) && is_valid_user_name($password)) {
+  if(!is_valid_user_name($name) || !is_valid_user_name($password)) {
     return { errors => { not_valid_format_of_name_or_password => 1 } };
   }
 
@@ -516,8 +516,9 @@ sub build_login_html {
 
   print "<h1>LOGIN<h1>";
   if(defined($args->{errors})) {
-    print "<h3 style='color:red;'>Your session expired.</h3>" if($args->{errors}->{session_expired});
-    print "<h3 style='color:red;'>Not valid user name or password</h3>"    if($args->{errors}->{not_valid_format_of_name_or_password});
+    print "<h3 style='color:red;'>Your session expired.</h3>"   if($args->{errors}->{session_expired});
+    print "<h3 style='color:red;'>Not valid password.</h3>"     if($args->{errors}->{not_valid_password});
+    print "<h3 style='color:red;'>Not valid user name or password</h3>" if($args->{errors}->{not_valid_format_of_name_or_password});
   }
   print <<EOD;
   <form id="login_form" method="post">
