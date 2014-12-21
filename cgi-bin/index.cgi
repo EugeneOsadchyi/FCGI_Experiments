@@ -4,7 +4,6 @@ use strict;
 use warnings;
 
 use FCGI;
-use CGI qw(:cgi);
 use CGI::Fast;
 use CGI::Cookie;
 
