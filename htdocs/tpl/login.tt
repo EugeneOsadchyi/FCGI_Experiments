@@ -1,0 +1,24 @@
+[% PROCESS header.tt
+           title = 'Login';
+%]
+<h1>LOGIN<h1>
+[% IF args.errors %]
+  [% IF args.errors.session_expired %]
+    <h3 style='color:red;'>Your session expired.</h3>
+  [% END %]
+  [% IF args.errors.not_valid_password %]
+    <h3 style='color:red;'>Not valid password.</h3>
+  [% END %]
+  [% IF args.errors.not_valid_format_of_name_or_password %]
+    <h3 style='color:red;'>Not valid user name or password</h3>
+  [% END %]
+[% END %]
+<form id="login_form" method="post">
+  <p>
+    <input type="text" id="user_name" name="user_name" placeholder="User Name"/><br/>
+    <input type="password" id="user_password" name="user_password" placeholder="Password"/>
+  </p>
+  <button type="submit">Send</button>
+</form>
+[% PROCESS footer.tt %]
+

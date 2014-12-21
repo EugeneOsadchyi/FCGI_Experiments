@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use FCGI;
+use CGI qw(:cgi);
 use CGI::Fast;
 use CGI::Cookie;
 
@@ -12,6 +13,7 @@ use IO::Select;
 
 use Data::Dumper;
 use JSON;
+use Template;
 
 # constants
 sub PIPES_PER_INSTANCE() { 2 };
@@ -414,7 +416,7 @@ sub handle_fcgi_requests {
     $query = prepare_request_to_db($params);
     $response = write_to_db($query, $READ_HANDLER, $WRITE_HANDLER);
 
-    build_html($response);
+    process_template($response);
   }
 }
 
@@ -480,88 +482,24 @@ sub write_to_db {
   return $response;
 }
 
-sub build_html {
+sub process_template {
   my $args = shift;
+
+  my $template = Template->new(INCLUDE_PATH => './htdocs/tpl');
+
+  my $template_data = {
+    pid              => "$$",
+    args             => $args,
+    surway_questions => (SURWAY_QUESTIONS),
+  };
 
   print "Content-type:text/html;charset=utf-8\r\n\r\n";
 
-  print <<EOD;
-<!DOCTYPE html>
-<html>
-  <head>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-EOD
-  print "<title>Welcome</title>";
-  print <<EOT;
-    </head>
-    <body>
-EOT
-
-  print "<h3>[$$-FCGI]</h3>";
-
-  if (defined($args->{surway})) {
-    build_welcome_html($args);
+  if (defined $args->{surway}) {
+      $template->process('surway.tt', $template_data) or die($@);
   } else {
-    build_login_html($args);
+      $template->process('login.tt', $template_data) or die($@);
   }
-
-  print <<EOT;
-    </body>
-  <html>
-EOT
-}
-
-sub build_login_html {
-  my $args = shift;
-
-  print "<h1>LOGIN<h1>";
-  if(defined($args->{errors})) {
-    print "<h3 style='color:red;'>Your session expired.</h3>"   if($args->{errors}->{session_expired});
-    print "<h3 style='color:red;'>Not valid password.</h3>"     if($args->{errors}->{not_valid_password});
-    print "<h3 style='color:red;'>Not valid user name or password</h3>" if($args->{errors}->{not_valid_format_of_name_or_password});
-  }
-  print <<EOD;
-  <form id="login_form" method="post">
-    <p>
-      <input type="text" id="user_name" name="user_name" placeholder="User Name"/><br/>
-      <input type="password" id="user_password" name="user_password" placeholder="Password"/>
-    </p>
-    <button type="submit">Send</button>
-  </form>
-<html>
-EOD
-}
-
-sub build_welcome_html {
-  my $args = shift;
-
-  my $user_name = $args->{user_name};
-  my $surway    = $args->{surway};
-
-
-  print "<h1>WELCOME</h1>";
-  print "<p>You logged in as $user_name</p>";
-  print "<form id='welcome_form' method='post'>";
-
-  foreach (sort keys (SURWAY_QUESTIONS)) {
-    my $question = (SURWAY_QUESTIONS)->{$_};
-    my $answer   = $surway->{$_};
-
-    print "<input type='checkbox' value='$_' name='$_' ", #TODO do something with value
-      (($answer ne '') ? "checked" : ()),
-      ">$question<br/>";
-  }
-
-  print "<input type='submit' value='Save Changes'/>";
-  print "</form>";
-
-
-  print <<EOT;
-<form id="logout_form" method="post">
-  <input type="hidden" name="logout" value="1"/>
-  <input type='submit' value='Logout'/>
-</form>
-EOT
 }
 
 ### END of FCGI code ###

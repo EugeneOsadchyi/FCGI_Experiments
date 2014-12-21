@@ -1,0 +1,23 @@
+[% PROCESS header.tt
+           title = 'Login';
+%]
+
+<h1>WELCOME</h1>
+<p>You logged in as [% args.user_name %]</p>
+<form id='welcome_form' method='post'>
+  [% FOREACH key IN surway_questions.keys.sort %]
+     [%
+        SET  question = surway_questions.$key;
+        SET  answer   = args.surway.$key;
+     %]
+  <input type='checkbox' value='[% key %]' name='[% key %]' [% IF answer %]checked[% END %]>[% question %]<br/>
+  [% END %]
+
+  <input type='submit' value='Save Changes'/>
+</form>
+<form id="logout_form" method="post">
+  <input type="hidden" name="logout" value="1"/>
+  <input type='submit' value='Logout'/>
+</form>
+[% PROCESS footer.tt %]
+
